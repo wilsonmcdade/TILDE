@@ -13,20 +13,19 @@ import pickle
 DEVICE = torch.device('cpu')
 # DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
+# Refactored to allow for passing parameters without building args structure
+def inference(queries, run, alpha, index_path="./TILDE/data/index/TILDE/passage_embeddings.pkl", save_path="", cut_off=1000, ckpt_path="ielab/TILDE", collection_path="./TILDE/data/collection.tsv"):
 
-def main(args):
-    queries = load_queries(args.query_path)
-    run = load_run(args.run_path)
-    model = BertLMHeadModel.from_pretrained(args.ckpt_path, cache_dir=".cache").eval().to(DEVICE)
+    model = BertLMHeadModel.from_pretrained(ckpt_path, cache_dir=".cache").eval().to(DEVICE)
     tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased', cache_dir=".cache")
     stop_ids = get_stop_ids(tokenizer)  # clean the BERT tokenizer vocabulary
 
-    if args.index_path.split('.')[-1] == "pkl":
-        with open(args.index_path, 'rb') as handle:
+    if index_path.split('.')[-1] == "pkl":
+        with open(index_path, 'rb') as handle:
             doc_embeddings = pickle.load(handle)
-    elif args.index_path.split('.')[-1] == "hdf5":
+    elif index_path.split('.')[-1] == "hdf5":
         doc_embeddings = {}
-        f = h5py.File(args.index_path, 'r')
+        f = h5py.File(index_path, 'r')
         doc_file = f['documents']
         for i in tqdm(range(len(doc_file)), desc="loading index....."):
             logs, tids = doc_file[i]
@@ -36,6 +35,10 @@ def main(args):
     total_ranking_time = 0
     lines = []
     for qid in tqdm(run.keys(), desc="Ranking queries...."):
+        # Some QIDs in the BM25 run will not be in the queries dict
+        #   because we trim the queries dict to perform the experiment.
+        if qid not in queries:
+            continue
         query = queries[qid]
         docids = run[qid]
 
@@ -43,7 +46,7 @@ def main(args):
         query_token_ids = tokenizer(query, add_special_tokens=False)["input_ids"]
         cleaned_query_token_ids = [id for id in query_token_ids if id not in stop_ids]  # only keep valid token ids
 
-        if args.alpha != 1:
+        if alpha != 1:
             query_inputs = tokenizer([query], return_tensors="pt", padding=True, truncation=True)
             query_input_ids = query_inputs["input_ids"]
 
@@ -70,20 +73,20 @@ def main(args):
 
         ranking_start = timer()
         for rank, docid in enumerate(docids):
-            if rank == args.cut_off:
+            if rank == cut_off:
                 break
             passage_log_probs, passage_token_id = doc_embeddings[docid]
             target_log_probs = passage_log_probs[cleaned_query_token_ids]
             score = np.sum(target_log_probs)
             QL_scores.append(score)
 
-            if args.alpha != 1:
+            if alpha != 1:
                 query_target_log_probs = query_log_probs[passage_token_id]
                 passage_score = np.sum(query_target_log_probs) / len(passage_token_id)  # mean likelihood
                 DL_scores.append(passage_score)
 
-        if args.alpha != 1:
-            scores = (args.alpha * np.array(QL_scores)) + ((1-args.alpha) * np.array(DL_scores))
+        if alpha != 1:
+            scores = (alpha * np.array(QL_scores)) + ((1-alpha) * np.array(DL_scores))
         else:
             scores = QL_scores
 
@@ -97,7 +100,7 @@ def main(args):
 
         for i in range(num_docs):
             score, docid = sorted_pairs[i]
-            lines.append(str(qid) + " " + "Q0" + " " + str(docid) + " " + str(i + 1) + " " + str(score) + " " + f"alpha{args.alpha}" + "\n")
+            lines.append(str(qid) + " " + "Q0" + " " + str(docid) + " " + str(i + 1) + " " + str(score) + " " + f"alpha{alpha}" + "\n")
             last_score = score
             last_rank = i
         # add the rest of ranks below cut_off, we don't need to re-rank them.
@@ -105,13 +108,21 @@ def main(args):
             last_score -= 1
             last_rank += 1
             lines.append(str(qid) + " " + "Q0" + " " + str(docid) + " " + str(last_rank + 1) + " " + str(
-                    last_score) + " " + f"alpha{args.alpha}" + "\n")
+                    last_score) + " " + f"alpha{alpha}" + "\n")
 
     print("Query processing time: %.1f ms" % (1000 * total_tokenizer_time / len(run.keys())))
     print("passage re-ranking time: %.1f ms" % (1000 * total_ranking_time / len(run.keys())))
 
-    with open(args.save_path, "w") as f:
+    with open(save_path, "w") as f:
         f.writelines(lines)
+
+
+def main(args):
+    queries = load_queries(args.query_path)
+    run = load_run(args.run_path)
+
+    inference(queries, run, args.alpha, args.index_path, args.save_path, args.cut_off, args.ckpt_path, args.collection_path)
+
 
 
 if __name__ == '__main__':
